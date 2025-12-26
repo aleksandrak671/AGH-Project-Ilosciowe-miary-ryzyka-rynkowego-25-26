@@ -1,0 +1,1 @@
+# AGH-Project-Ilo-ciowe-miary-ryzyka-rynkowego-25-26
