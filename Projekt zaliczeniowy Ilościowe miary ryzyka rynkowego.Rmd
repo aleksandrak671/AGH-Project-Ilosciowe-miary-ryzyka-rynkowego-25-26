@@ -1,0 +1,942 @@
+---
+title: 'Projekt zaliczeniowy: Ilościowe miary ryzyka rynkowego 25/26'
+author: "Aleksandra Konopelska"
+output: 
+  html_document:
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)  # pakiet do przetwarzania danych i wizualizacja (ggplot2, dplyr)
+library(moments)    # pakiet do obliczania skośności i kurtozy
+library(tseries)    # pakiet do testów statystycznych (np. Jarque-Bera)
+library(knitr)      # pakiet do tabel
+library(gridExtra)  # pakiet do wykresu
+library(tseries)    # pakiet do testów normalności
+library(nortest)    # pakiet do testu normalności Andersona-Darlinga
+library(knitr)      # pakiet do tabeli w var i es
+library(rugarch)    # pakiet do testów VaR
+```
+
+
+# Wprowadzenie do projektu
+
+## Cel i zakres projektu
+
+Celem mojego projektu będzie analiza ryzyka rynkowego dla wybranego przeze mnie indeksu **WIG20** na podstawie danych dziennych z lat 2016– 2024 (spełniających wymóg min. 8 lat).
+
+W projekcie będę realizowała następujące zadania:
+
+1.  **Opisanie empirycznego rozkładu stóp zwrotu**: wyświetle statystyki opisowe oraz skomentuję kluczowe wyniki.
+2.  **Sprawdzenie za pomocą min. dwóch testów normalności**, czy dane dzienne spełniają założenie o normalności.
+3.  **Zbudowanie szeregu oszacowań 99% VaR i 99% ES** w oparciu o 500-dniowe okno historyczne, wykorzystując dwie wybrane wersje metody historycznej:
+    * Prosta metoda historyczna
+    * Metoda historyczna z wagami
+4.  **Odpowiedź na pytanie, czy wyznaczony VaR jest wyznaczony wiarygodnie** (tj. nie jest zawyżony ani zaniżony) w oparciu o moje wyniki testów wstecznych (dla długości $m=250$).
+5.  **Ocena końcowa**, czy moje wyniki pozwalają twierdzić, że obie metody dają wiarygodne oszacowania.
+
+## O indeksie WIG20
+
+**WIG20** – indeks giełdowy 20 największych spółek akcyjnych notowanych na warszawskiej Giełdzie Papierów Wartościowych. Bazową datą dla indeksu jest 16 kwietnia 1994, zaś wartością bazową 1000 punktów.
+
+**Kluczowe cechy indeksu:**
+
+* **Typ indeksu:** Jest to indeks typu cenowego (przy jego obliczaniu bierze się pod uwagę jedynie ceny zawartych w nim transakcji).
+* **Ograniczenia:** W ramach WIG20 nie może być notowanych więcej niż 5 spółek z jednego sektora giełdowego.
+* **Wykluczenia:** W składzie indeksu nie są notowane fundusze inwestycyjne.
+
+Źródło: *Wikipedia (pl.wikipedia.org/wiki/WIG20)*
+
+## Pakiety
+
+Pakiety, które wykorzystuję w projekcie:
+
+```{r}
+library(tidyverse)  # pakiet do przetwarzania danych i wizualizacja (ggplot2, dplyr)
+library(moments)    # pakiet do obliczania skośności i kurtozy
+library(tseries)    # pakiet do testów statystycznych (np. Jarque-Bera)
+library(knitr)      # pakiet do tabel
+library(gridExtra)  # pakiet do wykresu
+library(tseries)    # pakiet do testów normalności
+library(nortest)    # pakiet do testu normalności Andersona-Darlinga
+library(knitr)      # pakiet do tabeli w var i es
+library(rugarch)    # pakiet do testów VaR
+```
+
+## Zmienne
+
+Moja analiza będzie przeprowadzona w oparciu o wybrany przeze mnie plik **`wig20_d.csv`** zawierający notowania indeksu WIG20. Szereg czasowy obejmuje dane dzienne.
+
+Zbioru danych posiada zmienne:
+
+| Nazwa zmiennej | Typ danych | Opis |
+| :--- | :---: | :--- | :--- |
+| **Data** | Data (YYYY-MM-DD) | Dzień sesji giełdowej. | 
+| **Otwarcie** | Liczbowy (Float) | Kurs indeksu na otwarciu sesji. | 
+| **Najwyzszy** | Liczbowy (Float) | Maksymalna wartość indeksu w trakcie sesji. | 
+| **Najnizszy** | Liczbowy (Float) | Minimalna wartość indeksu w trakcie sesji. | 
+| **Zamkniecie** | Liczbowy (Float) | Kurs indeksu na zamknięciu sesji. | 
+| **Wolumen** | Liczbowy (Integer) | Wartość obrotu akcjami wchodzącymi w skład indeksu. | 
+
+
+# Przygotowanie danych
+
+## Wybór i filtracja danych
+
+Do analizy ryzyka wybrałam indeks **WIG20** (plik `wig20_d.csv`). Dane obejmują okres od **2007-01-02** do **2024-11-29**, ale zgodnie z założeniami min. 8 lat, wybrałam okres od **2016-01-01** do **2024-11-29** co stanowi blisko 9 lat. Taki zakres pozwoli mi przetestować model w czasie kryzysów i konfliktów na świecie, jak pandemia COVID-19 czy wojna na Ukrainie.
+
+W strukturze danych uwzględniłam wymogi instrukcji:
+
+1.  **500-dniowe okno historyczne:** pierwsze 500 obserwacji, które posłużą jako baza do wyliczenia pierwszych miar ryzyka.
+
+2.  **Okres dla testów wstecznych (m=250):** ostatnie 250 obserwacji, na których sprawdzę wiarygodność wyznaczonych prognoz VaR.
+
+```{r}
+# wczytuje wybrane przeze mnie dane
+df <- read.csv("wig20_d.csv", stringsAsFactors = FALSE)
+df$Data <- as.Date(df$Data) # ustawiam dane jako typ data
+
+df <- df %>% 
+  # układam dni po kolei (od najstarszego), bo stopę zwrotu liczy się: (cena z dzisiaj / cena z wczoraj)
+  # i dni nie mogą być pomieszane bo wyjdą złe wyniki
+  arrange(Data) %>% 
+  
+  # wybieram dane od 1 stycznia 2016 do końca mojego pliku
+  # dzięki temu mam okres badawczy prawie 9 lat
+  filter(Data >= "2016-01-01") %>%
+  
+  # wybieram dane potrzebne mi do wzoru na stopy zwrotu  
+  # Zi = ln(Si / Si-1)
+  # Si -> cena zamknięcia (Zamkniecie) w dniu i
+  # Si-1 -> cena z dnia poprzedniego
+  select(Data, Zamkniecie)
+
+# tworzę tabele dla sprawdzenia moich danych
+weryfikacja <- data.frame(
+  Start_Badania = min(df$Data),
+  Koniec_Badania = max(df$Data),
+  Liczba_Dni = nrow(df),
+  Wymagane_Minimum = 750 
+  # wymagane min. danych by mójprojekt miał sens
+  # "500 dni okna" + "250 dni testów" = 750, tyle muszę mieć min.
+)
+
+# tabela
+kable(weryfikacja, caption = "Podsumowanie zakresu danych")
+```
+
+
+
+
+# Metodyka wyznaczania stóp zwrotu
+
+Instytucja finansowa powinna monitorować zmienność cen rynkowych dla interesujących ją walorów (m.in. stóp procentowych, cen akcji, kursów walutowych itp.). Na zajęciach definiowaliśmy proste i logarytmiczne stopy zwrotu:
+
+1.  **Proste stopy zwrotu**:
+    $$Z_i = \frac{S_i - S_{i-1}}{S_{i-1}}$$
+
+2.  **Logarytmiczne stopy zwrotu**:
+    $$Z_i = \ln\left(\frac{S_i}{S_{i-1}}\right)$$
+
+gdzie we wzorach:
+
+* $Z_i$ – stopa zwrotu w dniu $i$.
+
+* $S_i$ – wartość zmiennej (cena zamknięcia) w dniu $i$.
+
+* $S_{i-1}$ – wartość zmiennej w dniu poprzednim.
+
+
+**Mój wybór:**
+
+W moim projekcie zdecydowałam się na wykorzystanie **logarytmicznych stóp zwrotu**. 
+
+Oba podejścia mają zalety i wady, ale o ile znajomość stóp prostych w bardziej naturalny sposób oddaje informację o tym, jak zmienia się cena danego waloru, to lepsze własności matematyczne mają stopy logarytmiczne. W stopach logarytmicznych łączny zwrot z całego okresu (na przykład tygodnia) jest po prostu sumą zwrotów dziennych. Przy stopach prostych musiałabym stosować bardziej skomplikowane mnożenie, co utrudniałoby obliczenia na dużym zbiorze danych (jak u mnie okno 500 dni).
+
+
+```{r}
+# obliczam log stopy zwrotu (Zi)
+# funkcja (-) diff(log()): ln(Si) - ln(Si-1)
+# wynik mnożę * 100, aby mieć procenty (np. 1.5%), a nie ułamki (0.015)
+# aby ułatwić interpretację wykresów
+df$LogReturn <- c(NA, diff(log(df$Zamkniecie)) * 100)
+
+# usuwam pierwszy wiersz
+# wcześniej użyłam funkcji 'filter', która wyrzuciła stare dane sprzed mojego wybranego okresu min. 8 lat
+# przez to dla 1 stycznia 2016 nie widać dnia wczorajszego 
+# powstaje błąd (NA) i dlatego muszę go usunąć 
+df <- na.omit(df)
+
+# wyniki
+kable(head(df), 
+      col.names = c("Data (i)", "Cena Zamknięcia (Si)", "Log Stopa Zwrotu (Zi) [%]"),
+      caption = "Wyznaczone stopy zwrotu dla indeksu WIG20")
+```
+
+
+## Wykresy zmienności
+
+Poniższe wykresy przedstawiają przebieg notowań wybranego przeze mnie indeksu WIG20 oraz jego dzienne stopy zwrotu. Jest to wstępny etap analizy ryzyka, pozwalający ocenić charakter rynku.
+
+```{r}
+p1 <- ggplot(df, aes(x = Data, y = Zamkniecie)) +
+  geom_line(color = "darkblue", size = 0.6) +
+  labs(
+    title = "Notowania indeksu WIG20 (Ceny)", 
+    y = "Cena zamknięcia [pkt]",  
+    # WIG20 jest indeksem giełdowym więc jego wartość podaje się w punktach, a nie w zł
+    # punkty te odzwierciedlają łączną wartość rynkową 20 największych spółek
+    x = "Data"
+  ) +
+   theme_minimal() +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") + # by pokazać rok po roku na osi Y
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))   # by lekko pochylić daty żeby się zmieściły
+
+p1
+```
+
+**Wnioski z wykresu Notowania indeksu WIG20:**
+
+Na wykresie widać zmiany ceny zamknięcia indeksu WIG20 na przełomie moich wybranych lat **2016-01-01** do **2024-11-29**:
+
+1.  Widać na nim wyraźne **trendy**: rynek nie stoi w miejscu, tylko falami rośnie i spada.
+2.  Widać reakcje na wydarzenia na świecie: najbardziej gwałtowny pionowy spadek wystąpił w marcu 2020 roku przez wybuch pandemii i później w 2022-2023 związane z wojną na Ukrainie.
+
+Jest to obraz **cen ($S_i$)**, które posłużą mi w kolejnym kroku do obliczenia stóp zwrotu.
+
+```{r}
+p2 <- ggplot(df, aes(x = Data, y = LogReturn)) +
+  geom_line(color = "darkred", size = 0.4) +
+  labs(title = "Logarytmiczne stopy zwrotu WIG20", y = "Logarytmiczna stopa zwrotu/dzienna zmiana ceny na giełdzie [%]", x = "Data") +
+  theme_minimal()
+
+p2
+```
+
+**Wnioski z wykresu Logarytmiczne stopy zwrotu:**
+
+* **Zmienność nie jest stała:** na powyższym wykresie widać wyraźne różnice w "nerwowości" rynku w różnych latach. Czyli jest konieczność monitorowania zmienności cen rynkowych (ryzyko na giełdzie nie jest stałe, raz panuje spokój, raz duża nerwowość, więc musimy na bieżąco sprawdzać aktualną sytuację, aby dobrze ocenić zagrożenie).
+
+* **Zmienność w klastrach/grupach (heteroskedastyczność):** można także zauważyć na powyższym wykresie, że znaczne spadki i wzrosty cen często występują w seriach/grupach po sobie. Jest to szczególnie widoczne w okresach szoków na rynku, takich jak na początku 2020 roku (Pandemia COVID-19) czy początek 2022 roku (wybuch wojny na Ukrainie).
+
+* **Występowanie wartości ekstremalnych (grube ogony):** analiza powyższego wykresu sugeruje też, że dzienne stopy zwrotu nie mają rozkładu normalnego. Widać to poprzez bardzo długie linie na wykresie (np. gwałtowny spadek na początku 2020 roku), te obserwacje wskazują na wyższe prawdopodobieństwo wystąpienia krachów/spadków, niż zakładałby to rozkład normalny.
+
+Moje powyższe obserwacje sugerują odrzucenie hipotezy o normalności rozkładu, co w kolejnym kroku zweryfikuję testami statystycznymi.
+
+
+# Analiza statystyczna rozkładu stóp zwrotu
+
+Wstępna analiza wykresów w poprzedniej części projektu zasugerowała mi, że **stopy zwrotu mojego indeksu WIG20 charakteryzują się dużą zmiennością i występowaniem wartości skrajnych** (bardzo długie linie na wykresie/widoczne gwałtowne spadki, np. spadek na początku 2020 roku). W tej części projektu zweryfikuję te obserwacje metodami statystycznymi.
+
+**Celem tego etapu jest sprawdzenie, czy dzienne stopy zwrotu (czyli % zmiany cen z dnia na dzień) można opisać rozkładem normalnym.** Wynik tej analizy posłuży jako główne uzasadnienie dla wyboru metodyki (czyli konkretnego sposobu obliczania ryzyka VaR) w mojej dalszej części pracy.
+
+Weryfikacja ta jest niezbędna, ponieważ planuję wykorzystać **Metody Historyczne Prostą i z Wagami**. Zaletą metody historycznej jest to że cechują ją proste obliczenia oraz, brak założeń matematycznych dot. rozkładu stóp zwrotu (tj. założenie o normalności). Pozwali to na bezpośrednie wykorzystanie danych historycznych i uwzględnienie "grubych ogonów" oraz gwałtownych krachów, które rozkład normalny często ignoruje.
+
+Metoda prosta zakłada, że szanse na realizację każdego scenariusza są takie same. Aby uniknąć tego, wprowadze Metodę Historyczną z Wagami. Wybór metody z wagami wynika z faktu, że nowe obserwacje powinny mieć większą wagę, gdyż lepiej odzwierciedlają aktualną zmienność oraz obecne warunki na rynku. Przyjmując, że prawdopodobieństwa pi​ maleją wykładniczo (nadaje różną ważność danym w zależności od tego, jak dawno wystąpiły; najnowsze dni mają największy wpływ na wynik VaR, a wpływ starszych dni maleje bardzo szybko wraz z upływem czasu), model może szybciej "zapominać" o odległej przeszłości i bardziej dynamicznie reagować na nowe szoki rynkowe.
+
+Dlatego, jeśli poniższe testy wykażą brak normalności (czyli obecność nagłych spadków cen w moich danych), będzie to potwierdzeniem, że powinnam zastosować **Metody Historyczne** (w wersji prostej oraz z wagami). 
+
+
+## Statystyki opisowe
+
+```{r}
+# obliczenie statystyk opisowych
+statystyki <- data.frame(
+  Miara = c("Średnia", "Odchylenie Std.", "Mediana", "Kwartyl 1 (25%)", "Kwartyl 3 (75%)", "Skośność", "Kurtoza", "Min", "Max"),
+  Wartosc = c(
+    mean(df$LogReturn),
+    sd(df$LogReturn),
+    median(df$LogReturn),            
+    quantile(df$LogReturn, 0.25),    
+    quantile(df$LogReturn, 0.75),    
+    skewness(df$LogReturn),
+    kurtosis(df$LogReturn),
+    min(df$LogReturn),
+    max(df$LogReturn)
+  )
+)
+
+# tabela
+kable(statystyki, digits = 4, caption = "Statystyki opisowe logarytmicznych stóp zwrotu WIG20")
+```
+
+**Interpretacja wyników powyższej tabeli Statystyki opisowe logarytmicznych stóp zwrotu WIG20:**
+
+ - **Kurtoza:** wynosi 11.6612 jest to bardzo wysoki wynik. Świadczy to o występowaniu "grubych ogonów". Oznacza to, że krachy/spadki w WIG20 zdarzają się w rzeczywistości znacznie częściej, niż wynikałoby to z założeń rozkładu normalnego.
+
+ - **Skośność:** wynik ujemny (-0.6682) oznacza, że na rynku częściej występowały gwałtowne spadki niż gwałtowne wzrosty.
+
+ - **Minimum:** największa dzienna strata wyniosła aż -14.24%, co potwierdza występowanie krachów rynkowych w badanym okresie.
+
+**Wniosek:** Tak wysoka kurtoza i występowanie strat około -14% potwierdzają mi, że rozkład stóp zwrotu nie jest normalny. 
+
+
+## Wizualizacja normalności
+
+### Histogram
+
+```{r}
+moja_srednia <- mean(df$LogReturn)
+moje_odchylenie_std <- sd(df$LogReturn)
+
+ggplot(df, aes(x = LogReturn)) +  
+
+  # after_stat(density) = zamiast liczby dni pokazujemy gęstość,
+  # żeby histogram był w tej samej skali co rozkład normalny
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "grey", color = "white", alpha = 0.7) +
+  stat_function(fun = dnorm, 
+                args = list(mean = moja_srednia, sd = moje_odchylenie_std), 
+                color = "red", size = 1) +
+  labs(title = "Histogram stóp zwrotu WIG20 vs rozkład normalny",
+       x = "Dzienna stopa zwrotu [%]", 
+       y = "Gęstość") +
+  theme_minimal()
+```
+
+Na histogramie widać przede wszystkim leptokurtyczny charakter rozkładu (wysoki szczyt, wąska koncentracja wokół średniej, kurtoza u mnie to 11.66). Obecność "grubych ogonów" jest lepiej widoczna na poniższym wykresie Q-Q, gdzie punkty na krańcach wyraźnie odbiegają od linii referencyjnej rozkładu normalnego
+
+### Wykres Q-Q
+
+Wykresy Q-Q (Quantile-Quantile) to narzędzie pozwalające porównać dane z rozkładem normalnym. Na wykresie Q-Q rzeczywiste dane są przedstawione na osi X, a teoretyczne kwantyle rozkładu normalnego na osi Y. Jeśli punkty na wykresie Q-Q zbliżają się do prostej linii, oznacza to, że dane są zbliżone do rozkładu normalnego.
+
+Źródło: *[statystykabiomed.pl](https://statystykabiomed.pl/2024/03/28/1-8-jak-ocenic-normalnosc-rozkladu/).*
+
+Wykres dla moich danych: 
+
+```{r}
+# wykres Q-Q dla stóp zwrotu
+qqnorm(df$LogReturn, 
+       main = "Wykres Q-Q dla stóp zwrotu WIG20", 
+       xlab = "Teoretyczne kwantyle (Rozkład Normalny)", 
+       ylab = "Rzeczywiste stopy zwrotu (WIG20)",
+       col = "blue", pch = 19, cex = 0.5) 
+# pch -> wypełnienie pkt., cex -> wielkość pkt.
+
+# dodaje czerwoną linie do odniesienia (idealny rozkład normalny)
+qqline(df$LogReturn, col = "red", lwd = 2) # lwd -> grubość linii do odniesienia
+```
+
+**Interpretacja powyższego wykresu Q-Q:**
+
+Powyższy wykres dobrze pokazuje dowodów na brak normalności rozkładu stóp zwrotu WIG20.
+
+ - Punkty odchylają się na obu końcach od linii referencyjnej. (Jeśli punkty na wykresie Q-Q zbliżają się do prostej linii, oznacza to, że dane są zbliżone do rozkładu normalnego.)
+
+ - Lewy ogon: w lewym dolnym rogu niebieskie punkty znacząco odchodzą w dół od czerwonej linii. Oznacza to, że w rzeczywistości na rynku występują znacznie głębsze spadki, niż wynikałoby to z założeń rozkładu normalnego.
+
+
+**Wniosek:** Wykres może potwierdzić że istnieją "grube ogony". Zastosowanie w tym przypadku metod parametrycznych (zakładających normalność) prowadziłoby do drastycznego zaniżenia ryzyka i zignorowania największych krachów. 
+
+
+## Testy normalności rozkładu
+
+Zgodnie z wymogami instrukcji ("za pomocą min. dwóch testów"), aby ostatecznie potwierdzić, że stopy zwrotu nie podlegają rozkładowi normalnemu, przeprowadzam trzy testy statystyczne (metody statystyczne weryfikujące, czy dane pochodzą z populacji o rozkładzie normalnym):
+
+- **Test Jarque-Bera:** kluczowy test w mojej analizie, ponieważ bezpośrednio weryfikuje skośność i kurtozę, które obliczyłam powyżej. Test ten porównuje moje dane do idealnego rozkładu normalnego/Gaussa (dla którego skośność wynosi 0, a kurtoza 3). Sprawdza on, czy skośność i kurtoza moich danych różnią się istotnie od tych wartości oczekiwanych. Im bardziej moje dane odbiegają od normy (np. przez występowanie "grubych ogonów"), tym wynik statystyki JB będzie wyższy.
+
+ - **Test Shapiro-Wilka:** to podstawowy test statystyczny służący do weryfikacji, czy rozkład próby badawczej jest zbliżony do rozkładu normalnego. Test ten ma najwyższą moc dla małych i średnich prób (zalecany do N<5000), czyli pasujący do moich danych WIG20. Przy bardzo dużych próbach może być zbyt czuły, jednak w połączeniu z testem JB stanowi solidne potwierdzenie wyników.
+
+ - **Test Andersona-Darlinga:** to kolejny test statystyczny którego użyje służący do sprawdzenia, czy dane mają rozkład normalny. Wybrałam go, ponieważ jest on bardziej czuły na odchylenia w obszarach brzegowych (w ogonach), co w przypadku danych o częstym występowaniu wartości skrajnych (tzw. grubych ogonów), jak w moich logarytmicznych stopach zwrotu WIG20, daje bardziej wiarygodne podstawy do odrzucenia założenia o normalności.
+ 
+**Hipotezy badawcze dla wybranych przeze mnie testów:**
+
+* **$H_0$:** Rozkład stóp zwrotu jest normalny ($p \ge 0.05$).
+* **$H_1$:** Rozkład stóp zwrotu nie jest normalny ($p < 0.05$).
+
+**Decyzja:** Jeśli wartość **p-value** jest niska (mniejsza od przyjętego poziomu istotności $\alpha = 0.05$), odrzucę $H_0$ i stwierdzę brak normalności.
+
+```{r}
+# 1. test Jarque-Bera
+test_jb <- jarque.bera.test(df$LogReturn)
+
+# 2. test Shapiro-Wilka
+test_sw <- shapiro.test(df$LogReturn)
+
+# 3. test Andersona-Darlinga
+test_ad <- ad.test(df$LogReturn)
+
+# zestawienie wyników testów w tabeli
+wyniki_testow <- data.frame(
+  Test = c("Jarque-Bera", "Shapiro-Wilk", "Anderson-Darling"),
+  Statystyka = c(as.numeric(test_jb$statistic), 
+                 as.numeric(test_sw$statistic), 
+                 as.numeric(test_ad$statistic)),
+  p_value = c(
+    format(test_jb$p.value, scientific = FALSE),
+    format(test_sw$p.value, scientific = FALSE), # używam funkcji format() aby pokazać pełną liczbę p-value zamiast skrótu naukowego
+    format(test_ad$p.value, scientific = FALSE)
+  )
+)
+
+# tabela
+kable(wyniki_testow, digits = 4, caption = "Wyniki trzech testów normalności dla stóp zwrotu WIG20")
+```
+
+**Interpretacja powyższych wyników:**
+
+ - **Statystyka Jarque-Bera (7136.21):** p-value ≈ 0. Mój wynik jest bardzo wysoki, co wynika z wcześniejszych obliczeń: ogromnej kurtozy (11.66) i ujemnej skośności (na rynku częściej występowały gwałtowne spadki niż gwałtowne wzrosty). To dowód na to, że rozkład stóp zwrotu WIG20 jest bardzo daleki od normalnego.
+
+ - **Test Shapiro-Wilka (0.9469):** p-value ≈ 0 i wynik statystyki potwierdzają wynik pierwszego testu. 
+
+ - **Test Andersona-Darlinga:** p-value ≈ 0 stanowi trzecie, potwierdzenie braku normalności. 
+  
+ - **p-value ≈ 0:** we wszystkich trzech przeprowadzonych testach (JB, SW, AD) wartości te są ≈ 0 (poniżej poziomu istotności 0.05).
+
+**Wniosek:** Na podstawie wyników trzech wybranych testów statystycznych jednoznacznie odrzucam hipotezę o normalności rozkładu ($H_0$). Te same wyniki we wszystkich testach potwierdzają, że rozkład stóp zwrotu WIG20 posiada "grube ogony", co oznacza, że ryzyko wystąpienia dużych strat jest w rzeczywistości znacznie wyższe, niż zakładałby rozkład normalny. Stanowi to moje ostateczne uzasadnienie dla wyboru **Metody Symulacji Historycznej** (w obu wariantach: prostym i z wagami).
+
+
+# Wyznaczanie VaR i ES
+
+## Uzasadnienie wyboru metod
+
+1.  **Wybór Prosta Metody Historycznej:** metoda ta opiera się na założeniu że "jutrzejszy wynik naszej inwestycji powtórzy jeden z historycznych rezultatów". W tym podejściu każdy dzień z przeszłości (np. jak u mnie z 500 dni) ma taką samą szansę ponownego wystąpienia (p=1/N). Wybrałam ją ponieważ buduje ona rozkład ryzyka bezpośrednio w oparciu o konkretne wyniki, które faktycznie wystąpiły w przeszłości. Dzięki temu model "pamięta" rzeczywiste krachy/spadki (takie jak wybuch pandemii czy wojny na Ukrainie) i uwzględnia je w prognozie.
+
+2. **Wybór Metody Historycznej z Wagami:** w tej metodzie zmieniam podejście, stosując zasadę że "im starszy scenariusz, tym mniejsze prawdopodobieństwo realizacji”. W Etapie 1 zauważyłam na wykresie zmienność w czasie (okresy spokoju i nagłej nerwowości). Prosta metoda reagowałaby na te zmiany zbyt wolno (traktując dalszy rok 2016 tak samo jak wczoraj). Wersja z wagami naprawia ten problem nadając większe znaczenie nowszym obserwacjom w danych, lepiej oddaje bieżące warunki na rynku. Wagi maleją wykładniczo w czasie. Zastosuję parametr zaniku q=0.99 (w kodzie programu zmienna jako lambda) sprawi że najnowsze dane mają większy wpływ na wynik VaR, co pozwala modelowi szybciej adaptować się do bieżących warunków rynkowych.
+
+**Wzór na wagi:** 
+
+$$
+p_i = \frac{q^{n-i}(1-q)}{1-q^n}
+$$
+
+Gdzie u mnie:
+
+* $n = 500$ (liczba dni w oknie),
+* $q = 0.99$ (mój parametr zaniku, dzięki niemu mogę "manipulować szybkością "zapominania” (czyli decydujemy o tym, jak szybko prawdopodobieństwa zdarzeń starszych maleją), 𝑞 ∈ 0,1 z reguły jest bardzo bliskie 1 (np. 0.995)
+
+## Implementacja modelu (Szereg oszacowań VaR i ES)
+
+W tej części projektu realizuję punkt instrukcji: "w oparciu o 500-dniowe okno historyczne, zbudować szereg oszacowań 99% VaR i 99% ES".
+
+Aby zbudować wymagany szereg oszacowań (a nie tylko jedną wartość), obliczenia będę wykonywała za pomocą pętli dla każdego dnia badanego okresu. **Będzie to działało następująco:**
+
+ - Dla każdego badanego dnia, pobieram z historii dokładnie 500 ostatnich stóp zwrotu, które poprzedzają ten dzień.
+
+ - Na podstawie tych 500 obserwacji wyliczam bieżącą wartość ryzyka (VaR i ES) i zapisuję wynik dla danego dnia.
+
+ - Przechodzę do kolejnego dnia i powtarzam proces. Dzięki temu, że za każdym razem biorę aktualne 500 dni wstecz, mój model na bieżąco uwzględnia nowe informacje płynące z rynku, a stare dane naturalnie wychodzą poza zakres analizy.
+
+
+**Obliczenia wykonam dwiema wybranymi przeze mnie metodami:**
+
+1. **Prosta Metoda Historyczna:** gdzie będę traktować wszystkie 500 dni w oknie historycznym jednakowo (wagi równe).
+
+2. **Metoda Historyczna z Wagami:** w tym podejściu będę przypisywać obserwacjom wagi, które maleją w czasie (parametr λ=0.99). Dzięki temu najnowsze dane w 500-dniowym oknie mają znacznie większy wpływ na wynik (wyższą wagę) niż dane starsze. Pozwoli to modelowi szybciej adaptować się do bieżących warunków na rynku.
+    
+```{r}
+# konfiguruje mój model
+dlugosc_okna <- 500      # długość okna (N=500), tyle dni wstecz biorę do analizy
+poziom_istotnosci <- 0.01
+lambda <- 0.99           #  parametr 'q' dla metody z wagami (na slajdach z reguły bardzo bliskie 1) dzięki niemu nowsze dane są ważniejsze dla modelu
+
+
+# przygotowuje miejsca na wyniki
+liczba_wszystkich_dni <- nrow(df)  # sprawdzam ile mam wierszy w danych (df)
+
+# tworzę puste pojemniki/miejsca (wektory), wypełnione na razie brakami danych (NA)
+# by mieć zarezerwowane miejsce, zanim zacznę liczyć w pętli
+
+# miejsce na wyniki Prostej Metody Historycznej
+wyniki_proste_var <- rep(NA, liczba_wszystkich_dni)
+wyniki_proste_es  <- rep(NA, liczba_wszystkich_dni)
+
+# miejsce na wyniki Metody z wagami 
+wyniki_wagi_var <- rep(NA, liczba_wszystkich_dni)
+wyniki_wagi_es  <- rep(NA, liczba_wszystkich_dni)
+```
+
+
+Wewnątrz pętli, dla każdego 500-dniowego okna, wyznaczam ryzyko dwiema wybranymi przeze mnie metodami:
+
+1. **Prosta Metoda Historyczna**
+
+* *VaR 99%*: sortuję 500 historycznych stóp zwrotu od najgorszej do najlepszej. Skoro szukam 1% najgorszych przypadków z 500 dni, wyznaczam VaR jako wartość piątego wyniku na tej liście ($500 \times 0,01 = 5$). Jest to moja "bezpieczna granica", zakładam, że z 99% pewnością rzeczywista strata nie będzie większa niż ta liczba.
+
+* *ES 99%*: to wartość oczekiwana strat przekraczających poziom VaR. W moim kodzie, dla danych dyskretnych (skończona próba 500 dni), estymuję to jako średnią z obserwacji w ogonie rozkładu (czyli średnią z 5 najgorszych wyników). Wynik ten informuje mnie o tym, jak duża będzie przeciętna strata, jeśli moja bezpieczna granica (VaR) zostanie przekroczona.
+
+2. **Metoda Historyczna z Wagami**
+
+W tej metodzie nie traktuję wszystkich dni jednakowo. Przyjmuję założenie, że dni z ostatniego tygodnia są dla modelu ważniejsze (mają większy wpływ na wynik) niż z dalszego okresu czasu.
+
+* *VaR 99%*: układam listę dni od największej straty do największego zysku. Każdy dzień ma swoją "wagę" (ważność). Sumuję wagi tych dni, zaczynając od największych strat. W momencie, gdy suma ważności osiągnie poziom 1%, sprawdzam, jaki wynik przypisany był do ostatniego dodanego dnia –> jest będzie mój VaR.
+
+* *ES 99%*: wyznaczam to jako średnią ważoną z najgorszych wyników. W odróżnieniu od metody prostej, tutaj nowsze krachy mają większy wpływ na ostateczny wynik. Jeśli duża strata zdarzyła się niedawno, mój ES będzie znacznie wyższy, ponieważ model uznaje to zdarzenie za bardziej istotne dla bieżącej oceny ryzyka.
+ 
+
+**Uwaga do Metody z wagami:** W tej metodzie nie stosuję zwykłej średniej arytmetycznej, ponieważ byłoby to błędne przy danych, które mają różne wagi. Zamiast tego będę obliczać średnią ważoną z ogona rozkładu. Polega to na wyodrębnieniu 1% najgorszych wyników i przeliczeniu ich wag tak, aby wewnątrz samego ogona sumowały się do 1 (normalizacja). Dzięki temu wynik metody jest spójny z modelem VaR i sprawia, że niedawne, gwałtowne spadki mają większy wpływ na prognozowaną wielkość ekstremalnej straty.
+    
+```{r}
+# moja pętla obliczeniowa
+# zaczynam pracę od wiersza 501 (czyli od 3 stycznia 2018 roku), 
+# bo dopiero wtedy mam w moim oknie historycznym pełne 500 dni historii z lat 2016-2017
+for(i in (dlugosc_okna + 1):liczba_wszystkich_dni) {
+  
+  # wybieram z tabeli 500 ostatnich dni, żeby na ich podstawie sprawdzić, 
+  # jakie ryzyko mamy dzisiaj (w dniu o numerze i)
+  historia <- df$LogReturn[(i - dlugosc_okna):(i - 1)]
+
+# metoda 1: Prosta Metoda Historyczna
+  
+  # układam te 500 wyników w kolejce: od największej straty do największego zysku
+  historia_posortowana <- sort(historia)
+  
+  # szukam 1% najgorszych przypadków z 500 dni (bo 1% z 500 to 5)
+  indeks_var <- ceiling(poziom_istotnosci * dlugosc_okna) # ceiling -> zaokrągla wynik zawsze w górę do pełnej liczby
+  
+  # ta piąta najgorsza wartość to mój VaR "z 99% pewnością dzisiaj nie stracę więcej niż to"
+  wyniki_proste_var[i] <- historia_posortowana[indeks_var]
+  
+ # obliczam średnia z 1% najgorszych wyników
+ # będzie mi ona mówić jakiej średniej straty mogę się spodziewać, jeśli sytuacja na giełdzie 
+ # pogorszy się bardziej niż przewiduje to poziom VaR.
+ wyniki_proste_es[i] <- mean(historia_posortowana[1:indeks_var])
+  
+  
+# metoda 2: Metoda Historyczna z Wagami
+  
+  # przypisuje wagi
+  # generuję potęgi od 499 do 0; dzięki temu najnowszy dzień (potęga 0) 
+  # dostanie największą wagę (lambda^0 = 1), a najstarszy najmniejszą
+  potegi <- (dlugosc_okna - 1):0 
+  wagi_surowe <- lambda ^ potegi
+  
+  # dzielę wagi przez ich sumę, aby łącznie dawały 1 (suma wszystkich prawdopodobieństw musi wynosić dokładnie 1 (100%))
+  # aby traktować je jako prawdopodobieństwa w rozkładzie
+  wagi <- wagi_surowe / sum(wagi_surowe) 
+  
+  # tworzę tabelę, w której każdemu wynikowi z historii
+  # przypisuję jego wyliczoną wage ("ważność")
+  tabela_pomocnicza <- data.frame(zwrot = historia, waga = wagi)
+  
+  # układam wyniki w kolejności od najgorszego (największa strata) do najlepszego
+  tabela_pomocnicza <- tabela_pomocnicza[order(tabela_pomocnicza$zwrot), ]
+  
+  # wyznaczam VaR
+  # liczę sumę skumulowaną wag idąc od najgorszych strat
+  tabela_pomocnicza$waga_skumulowana <- cumsum(tabela_pomocnicza$waga)
+  
+  # szukam momentu, w którym skumulowana waga przekroczy mój próg 1% (0.01)
+  # pierwszy wynik spełniający ten warunek to będzie mój VaR
+  indeks_wagi <- which(tabela_pomocnicza$waga_skumulowana >= poziom_istotnosci)[1]
+  wyniki_wagi_var[i] <- tabela_pomocnicza$zwrot[indeks_wagi]
+  
+  # ES to średnia strata z najgorszych dni które przebiły barierę VaR
+  # dlatego biorę z tabeli tylko wiersze od początku (największa strata) 
+  # aż do momentu gdzie znajduje się mój VaR -> resztę odrzucam
+  dane_ogon <- tabela_pomocnicza[1:indeks_wagi, ]
+  
+  # ponieważ wycięłam tylko fragment danych (ogon), sumuje się on do małej liczby
+  # przeliczam ich wagi tak, aby w tej grupie sumowały się do 100% (1.0)
+  # gdybym tego nie podzieliła, średnia strata wyszłaby błędna (za mała)
+  wagi_ogon_norm <- dane_ogon$waga / sum(dane_ogon$waga)
+
+  # liczę średnią ważoną strat w ogonie
+  # dzięki temu niedawne ekstremalne straty mocniej wpływają na wynik ES
+  wyniki_wagi_es[i] <- sum(dane_ogon$zwrot * wagi_ogon_norm)
+}
+
+
+# przenosze moje wyniki:
+# do tej pory wyliczone ryzyko (VaR i ES) trzymałam w osobnych, tymczasowych listach
+# teraz wklejam te listy do mojej głównej tabeli z danymi (df) jako nowe kolumny
+# dzięki temu obok daty i zwrotu będę miała od razu wyliczone ryzyko dla każdego dnia
+df$VaR_Prosta_99 <- wyniki_proste_var
+df$ES_Prosta_99  <- wyniki_proste_es
+df$VaR_Wagi_99 <- wyniki_wagi_var
+df$ES_Wagi_99  <- wyniki_wagi_es
+
+# ponieważ moja pętla zaczęła liczyć wyniki dopiero od 501. dnia (styczeń 2018)
+# pierwsze 500 wierszy w kolumnach VaR i ES jest pustych (NA)
+# usuwam je aby zostawić tylko te dni, dla których mam pełne wyniki modelu
+df_model <- na.omit(df)
+
+# podgląd wyników dla sprawdzenia poprawności
+kable(head(df_model[, c("Data", "LogReturn", "VaR_Prosta_99", "ES_Prosta_99", "VaR_Wagi_99", "ES_Wagi_99")]), 
+      caption = "Pierwsze oszacowania ryzyka (VaR i ES)")
+```
+
+**Wnioski z tabeli kilku początkowych danych:**
+
+ - **VaR vs ES:** ES generuje wyższą stratę niż VaR (ok. -3,21% vs -2,67%). Czyli, na początkowych kilku danych mogę powiedzieć że model działa dobrze na razie bo VaR wyznacza maksymalną tolerowaną stratę na danym poziomie ufności, natomiast ES szacuje średnią wielkość straty w sytuacji, gdy ten poziom zostanie przekroczony.
+
+ - **Prosta Metoda Historyczna:** wyznaczyła u mnie wyższy poziom ryzyka (ok. -2,67%), ponieważ wciąż uwzględnia dawne krachy z historii z taką samą ważnością jak dni obecne.
+
+ - **Metoda Historyczna z Wagami**: pokazała niższe ryzyko (ok. -2,01%), ponieważ szybciej zareagowała na ostatni spokój na giełdzie, nadając nowszym danym większe znaczenie.
+
+
+**Różnica w metodach:** Dla kilku początkowych zmiennych mogę jak na razie stwierdzić, że metoda Prosta ocenia ryzyko surowiej (-2,67%), ponieważ pamięta stare krachy z przeszłości. Metoda Ważona jest bardziej optymistyczna (-2,01%), bo zauważa, że ostatnio na rynku panuje spokój i szybko obniża wymogi kapitałowe.
+
+
+## Wizualizacja wyników
+
+**Prosta Metoda Historyczna:**
+```{r}
+ggplot(df_model, aes(x = Data)) +
+  geom_line(aes(y = LogReturn), color = "gray80", alpha = 0.5) +
+  geom_line(aes(y = VaR_Prosta_99, color = "VaR 99%"), size = 0.8) +
+  geom_line(aes(y = ES_Prosta_99, color = "ES 99%"), size = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("VaR 99%" = "red", "ES 99%" = "blue")) +
+  labs(title = "Metoda Prosta: VaR, ES",
+       y = "Stopa zwrotu / Ryzyko [%]", x = "Data", color = "Miara ryzyka") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+Linie na wykresie są dość sztywne. Dzieje się tak, ponieważ Metoda Prosta wolno reaguje na nowe dane i długo "pamięta" stare wydarzenia. Linia przerywana (ES) znajduje się zawsze poniżej linii ciągłej (VaR): średnia strata z najgorszych dni jest bardziej dotkliwa niż sam próg, od którego te najgorsze dni zaczynamy liczyć. 
+
+
+**Metoda Historyczna z Wagami**:
+```{r}
+ggplot(df_model, aes(x = Data)) +
+  geom_line(aes(y = LogReturn), color = "gray80", alpha = 0.5) +
+  geom_line(aes(y = VaR_Wagi_99, color = "VaR 99%"), size = 0.8) +
+  geom_line(aes(y = ES_Wagi_99, color = "ES 99%"), size = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("VaR 99%" = "red", "ES 99%" = "blue")) +
+  labs(title = "Metoda z Wagami: VaR, ES",
+       y = "Stopa zwrotu / Ryzyko [%]", x = "Data", color = "Miara ryzyka") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+Widać, że linie na tym wykresie są bardziej poszarpane. Oznacza to, że model jest bardzo czuły: szybciej reaguje na zmiany cen, podnosząc lub obniżając ryzyko z dnia na dzień. Podobnie jak w poprzednim wykresie, przerywana linia (ES) biegnie poniżej ciągłej (VaR). Potwierdza to, że model poprawnie liczy średnią stratę, która jest zawsze dotkliwsza niż "próg ostrzegawczy." 
+
+
+**Porównanie Metod:**
+```{r}
+ggplot(df_model, aes(x = Data)) +
+  # rzeczywiste wyniki z giełdy (zyski i straty)
+  geom_bar(aes(y = LogReturn), stat = "identity", fill = "lightgray", alpha=0.5) +
+  
+  # metoda prosta
+  geom_line(aes(y = VaR_Prosta_99, color = "VaR Prosty"), size = 0.8) +
+  geom_line(aes(y = ES_Prosta_99, color = "ES Prosty"), size = 0.8, linetype = "dashed") +
+  
+  # metoda z wagami
+  geom_line(aes(y = VaR_Wagi_99, color = "VaR z Wagami"), size = 0.8) +
+  geom_line(aes(y = ES_Wagi_99, color = "ES z Wagami"), size = 0.8, linetype = "dashed") +
+  
+  
+  scale_color_manual(values = c("VaR Prosty" = "red", 
+                                "ES Prosty" = "darkred",
+                                "VaR z Wagami" = "blue", 
+                                "ES z Wagami" = "darkblue")) +
+  
+  labs(title = "Zestawienie razem: VaR i ES (Prosta vs z Wagami)",
+       y = "Stopa zwrotu / Ryzyko [%]", 
+       x = "Data", 
+       color = "Legenda") +
+  
+  theme_minimal() + 
+  theme(legend.position = "bottom")
+```
+
+Na powyższym wykresie widać że VaR z metody z wagami (linia niebieska) jest bardziej zmienny i szybciej reaguje na nagłe wzrosty ryzyka, co jest szczególnie widoczne w okresach kryzów na świecie, takich jak pandemia COVID-19 czy początek wojny na Ukrainie. Prosta metoda historyczna (linia czerwona) reaguje wolniej i daje bardziej wygładzony, stabilny poziom ryzyka, ponieważ w równym stopniu uwzględnia także stare obserwacje. W okresach stabilizacji rynku VaR z metody z wagami szybciej się obniża, lepiej odzwierciedlając bieżące warunki rynkowe.
+
+
+
+# Weryfikacja modeli (Backtesting)
+
+Zgodnie z wymogami projektu (dla długości m = 250), w tej części będę dokonywać walidacji moich modeli na próbie testowej obejmującej **ostatnie 250 dni sesyjnych**. Moim celem będzie odpowiedzenie na pytanie, czy wyznaczony VaR jest wyznaczony wiarygodnie (tj. nie jest zawyżony ani zaniżony). Czy owe wyniki pozwalają twierdzić, że obie metody dają wiarygodne oszacowania?
+
+
+Weryfikację opieram na trzech rzeczach:
+
+1.  **Analiza ilościowa wyjątków (tzw. test wartości rzeczywistych.):** 
+
+sprawdzam, czy liczba dni, w których ponieśliśmy stratę większą niż VaR, jest bliska 1%.
+
+ - jeśli wyjątków jest za dużo, to znaczy, że model jest zbyt optymistyczny i zaniża ryzyko (naraża na niespodziewane straty).
+
+ - jeśli wyjątków jest za mało (np. 1 na 600 dni, jak w przykładzie z wykładu), to model jest zbyt ostrożny. To też jest błąd, bo na przykład zmusza bank do niepotrzebnego zamrażania gotówki w rezerwach, zamiast nią obracać.
+ 
+
+2.  **Testy statystyczne:**
+
+**Test Kupca:** to test statystyczny którego statystyka opiera się na logarytmie wiarogodności i ma rozkład $\chi^2(1)$. Jego hipotezy to
+ 
+ * $H_0$: VaR jest dobrze wyznaczony.
+ * $H_1$: VaR nie jest dobrze wyznaczony.
+
+**Test Christoffersona:** test który odpowiada na pytanie, czy momenty przekroczenia VaR (wyjątki) są od siebie niezależne, czy też występują seriami (klastrowanie). Wystąpienie jednego wyjątku nie jest jeszcze tak złe, ale jeśli pociąga on za sobą kolejne przekroczenia w następnych dniach, może to oznaczać "początek cyklu złych zdarzeń". Jego hipotezy to:
+ 
+ * $H_0$: przekroczenia VaR są niezależne w czasie.
+ * $H_1$: przekroczenia VaR nie są niezależne w czasie.
+    
+3. **Podejście regulacyjne dla testowania wstecznego**: 
+
+to test/regulator, który wprowadził kolorowe strefy (tzw. test
+świateł), które mówią o tym, jak groźne są zaobserwowane przekroczenia VaR
+
+ - **Strefa Zielona (0-4 wyjątki)**: jest to sytuacja bezpieczna, bo regulator uznaje model za wiarygodny. 
+
+ - **Strefa Żółta (5-9 wyjątków)**: to strefa która mówi że model myli się zbyt często. Oznacza sytuację, w której trzeba monitorować sytuację. Regulator uznaje, że ryzyko jest większe niż sądzimy, więc nakłada "karę" = zwiększa współczynnik k. Oznacza to, że musimy zamrozić więcej gotówki w rezerwach na pokrycie potencjalnych strat.
+
+ - **Strefa Czerwona (10 i więcej wyjątków):** sytuacja jest zła. Oznacza, że model wymaga poprawienia.
+
+```{r}
+# przygotowuje dane testowe
+# wybieram ostatnie 250 obserwacji z mojego modelu
+okno_testowe <- tail(df_model, 250)
+n_test <- nrow(okno_testowe)
+alpha <- 0.01 # poziom ufności 99%
+
+# zliczam wyjątki (przekroczenia)
+# będę sprawdzać ile razy model się pomylił
+# wyjątek będzie wtedy, gdy rzeczywista strata na giełdzie jest większa 
+# niż przewidywał model VaR.
+
+# dla metody prostej:
+# sprawdzam czy w danym dniu strata (LogReturn) była większa niż VaR dla metody prostej
+# jeśli tak = 1 (wyjątek).
+# Jeśli nie = wpisz 0 (model zadziałał poprawnie)
+hits_prosta <- ifelse(okno_testowe$LogReturn < okno_testowe$VaR_Prosta_99, 1, 0)
+
+# sumuje wszystkie wyjątki (1) by wiedzieć ile błędów było łącznie w ciągu 250 dni
+liczba_hits_prosta <- sum(hits_prosta)
+
+# dla metody z wagami:
+# robie to samo co dla metody prostej
+# sprawdzam czy w danym dniu strata była większa niż VaR dla metody z wagami
+hits_wagi <- ifelse(okno_testowe$LogReturn < okno_testowe$VaR_Wagi_99, 1, 0)
+
+# sumuje wyjątki dla metody ważonej
+liczba_hits_wagi <- sum(hits_wagi)
+```
+
+
+## Analiza ilościowa wyjątków (tzw. test wartości rzeczywistych):
+
+```{r}
+# obliczam procentowy udział wyjątków
+proc_prosta <- (liczba_hits_prosta / n_test) * 100
+proc_wagi <- (liczba_hits_wagi / n_test) * 100
+
+# tabela
+analiza_ilosciowa <- data.frame(
+  Metoda = c("Prosta Historyczna", "Historyczna z Wagami"),
+  Liczba_Wyjatkow = c(liczba_hits_prosta, liczba_hits_wagi),
+  Proc_Wyjatkow = c(paste(round(proc_prosta, 2), "%"), 
+                       paste(round(proc_wagi, 2), "%"))
+)
+
+kable(analiza_ilosciowa, caption = "Analiza ilościowa wyjątków (tzw. test wartości rzeczywistych)")
+```
+
+**Wyniki z Analizy ilościowej wyjątków (tzw. test wartości rzeczywistych):**
+
+Celem modelu (dla alpha=99%) jest osiągnięcie liczby wyjątków jak najbliższej 1%. W moim badaniu (dla 250 dni) dobrze byłoby około 2-3 wyjątków.
+
+ - *Metoda Prosta Historyczna (1.6%):* 4 wyjątki. Wynik jest bardzo bliski celowi. Model dość dobrze szacuje ryzyko i nie jest ani przesadnie ostrożny, ani zbyt ryzykowny.
+
+ - *Metoda Historyczna z Wagami (2.4%):* 6 wyjątków. Wynik ten jest ponad 2 razy wyższy od oczekiwanego poziomu 1%. Czyli w rzeczywistości straty zdarzały się znacznie częściej, niż mój model przewidywał. Model był zbyt optymistyczny.
+
+**Wniosek:** Wstępna analiza ilościowa wskazała mi na przewagę Metody Prostej, która znacznie lepiej trzyma się założonego poziomu 1% błędów.
+
+
+## Wyniki analizy z Podejścia regulacyjnego dla testowania wstecznego (tzw. test świateł)
+
+```{r}
+# obliczam oczekiwaną liczbę wyjątków (dla 1% z 250 dni powinno to być 2.5)
+oczekiwane <- n_test * alpha
+
+# funkcja do określania kolorów strefy
+oznacz_strefe <- function(liczba_wyjatkow) {
+  if (liczba_wyjatkow <= 4) {
+    return("zielony")
+  } else if (liczba_wyjatkow <= 9) {
+    return("żółty")
+  } else {
+    return("czerwony")
+  }
+}
+
+# funkcja ustalająca współczynnik k
+oznacz_k <- function(liczba_wyjatkow) {
+  if (liczba_wyjatkow <= 4) {
+    return(3.00)  # brak kary
+  } else if (liczba_wyjatkow == 5) {
+    return(3.40)
+  } else if (liczba_wyjatkow == 6) {
+    return(3.50)
+  } else if (liczba_wyjatkow == 7) {
+    return(3.65)
+  } else if (liczba_wyjatkow == 8) {
+    return(3.75)
+  } else if (liczba_wyjatkow == 9) {
+    return(3.85)
+  } else {
+    return(4.00)
+  }
+}
+
+# funkcja obliczająca prawdopodobieństwo skumulowane
+# liczę to z rozkładu dwumianowego dla okna 250 dni i VaR 99%
+oznacz_prawdopodobienstwo <- function(liczba_wyjatkow) {
+  
+  # używam funkcji pbinom (rozkład dwumianowy)
+  # wpisuję mu 3 dane:
+  # q = liczba_wyjatkow 
+  # size = 250 (bo testuje ostanie 250 dni)
+  # prob = 0.01 (VaR 99%, więc szansa na błąd to 1% = 0.01)
+  p_val <- pbinom(q = liczba_wyjatkow, size = 250, prob = 0.01)
+  
+  return(format(round(p_val, 4), nsmall = 4))
+}
+
+# tabela z wynikami
+wyniki_liczbowe <- data.frame(
+  Metoda = c("Prosta Historyczna", "Historyczna z Wagami"),
+  Liczba_Dni = c(n_test, n_test),
+  Wyjatki = c(liczba_hits_prosta, liczba_hits_wagi),
+  Strefa = c(oznacz_strefe(liczba_hits_prosta), 
+             oznacz_strefe(liczba_hits_wagi)),
+  Wspolczynnik_k = c(oznacz_k(liczba_hits_prosta), 
+                     oznacz_k(liczba_hits_wagi)),
+  Cum_Prob = c(oznacz_prawdopodobienstwo(liczba_hits_prosta),
+                         oznacz_prawdopodobienstwo(liczba_hits_wagi))
+)
+
+# tabela
+kable(wyniki_liczbowe, caption = "Test świateł (Strefa, Kara k, Prawdopodobieństwo)")
+```
+
+
+**Wyniki z tabeli:**
+
+1. **Metoda Prosta Historyczna (zielony):** traktuje wszystkie dni z historii tak samo ważnie. Dzięki temu długo pamięta stare krachy/spadki i nie bagatelizuje ryzyka. W moim przypadku model okazał się wiarygodny. Mieści się w normie (do 4 wyjątków), więc regulator uznaje go za bezpieczny.
+
+2. **Metoda Historyczna z Wagami (żółty):** ta metoda patrzy głównie na to, co działo się ostatnio. Gdy na rynku panował spokój, model zbyt szybko obniżył prognozowane ryzyko (był zbyt optymistyczny). Gdy nastąpiło pogorszenie, bariera została łatwo przebita (6 wyjątków u mnie). Model jest więc niedoszacowany, co skutkuje nałożeniem kary regulacyjnej (współczynnik k).
+
+**Wniosek:** W moim badaniu Metoda Prosta okazała się lepsza. Mimo że reaguje wolniej na zmiany, zapewniła nam większy margines bezpieczeństwa. Metoda z wagami zbyt optymistycznie oceniła rynek.
+
+
+
+## Testy: Kupca i Christoffersona
+
+Przyjmuję poziom istotności α=0.05.
+
+ - p-value > 0.05: brak podstaw do odrzucenia H0​. Model jest dobrze wyznaczony, wyjątki nie występują seriami.
+
+ - p-value < 0.05: odrzucam H0​. Model jest błędny lub występuje zjawisko klastrowania/grupowania.
+
+```{r}
+# testy dla metody prostej
+test_prosta <- VaRTest(alpha = 0.01, 
+                       actual = okno_testowe$LogReturn, 
+                       VaR = okno_testowe$VaR_Prosta_99, 
+                       conf.level = 0.95)
+
+# testy dla metody z wagami
+test_wagi <- VaRTest(alpha = 0.01, 
+                     actual = okno_testowe$LogReturn, 
+                     VaR = okno_testowe$VaR_Wagi_99, 
+                     conf.level = 0.95)
+
+# tabela
+tabela_testow <- data.frame(
+  Metoda = c("Prosta Historyczna", "Historyczna z Wagami"),
+  
+  # test Kupca
+  P_Val_Kupiec = c(test_prosta$uc.LRp, test_wagi$uc.LRp),
+  
+  # test Christoffersena
+  P_Val_Christoffersen = c(test_prosta$cc.LRp, test_wagi$cc.LRp)
+)
+
+kable(tabela_testow, digits = 4, caption = "Wyniki testów (p-value)")
+```
+
+
+**Wyniki z tabeli Wyniki testów (p-value)**:
+
+1. **Metoda Prosta Historyczna:**
+
+ - *Test Kupca (p-value 0.3805 > 0.05):* brak podstaw do odrzucenia H0​. Nie ma podstaw, by twierdzić, że model jest błędny.
+
+ - *Test Christoffersena (p-value 0.6377 > 0.05):* brak podstaw do odrzucenia H0​. Przekroczenia VaR są niezależne w czasie. Nie występuje zjawisko klastrowania/grupowania, co oznacza, że model jest stabilny.
+
+2. **Metoda Historyczna z Wagami:**
+
+ - *Test Kupca (p-value 0.0594 > 0.05):* brak podstaw do odrzucenia H0​, ale mój wynik jest na granicy błędu. Wskazuje na to, że liczba wyjątków jest niebezpiecznie wysoka, choć jeszcze mieści się w normie statystycznej.
+ 
+ - *Test Christoffersena (p-value 0.1458 > 0.05):* brak podstaw do odrzucenia H0​. Przekroczenia VaR są niezależne w czasie. Nie występuje zjawisko klastrowania/grupowania, co oznacza, że model jest stabilny.
+
+**Wniosek:** Obie metody są akceptowalne (w żadnej był brak podstaw do odrzucenia H0​). Jednak Metoda z Wagami jest na granicy odrzucenia, co razem z karą regulacyjną/wspołczynnikiem k (k=3.50) czyni ją w badanym okresie znacznie gorszym wyborem niż Metoda Prosta.
+
+
+
+## Wizualizacja weryfikacji
+
+Na poniższym wykresie przedstawiam zgodnie z wymogami projektu (dla długości m = 250) walidacje moich modeli na próbie testowej obejmującej ostatnie 250 dni sesyjnych. Czerwone punkty oznaczają dni, w których model zawiódł (rzeczywista strata przebiła barierę VaR).
+
+```{r}
+# sprawdzam czy rzeczywista strata (LogReturn) przebiła "barierę bezpieczeństwa" (VaR)
+# jeśli mój model zawiódł: X
+# jeśli mój model zadziałał: NA
+okno_testowe$Hit_Point_Prosta <- ifelse(okno_testowe$LogReturn < okno_testowe$VaR_Prosta_99, okno_testowe$LogReturn, NA)
+okno_testowe$Hit_Point_Wagi <- ifelse(okno_testowe$LogReturn < okno_testowe$VaR_Wagi_99, okno_testowe$LogReturn, NA)
+
+ggplot(okno_testowe, aes(x = Data)) +
+  # słupki stóp zwrotu moich danych wig20
+  geom_bar(aes(y = LogReturn), stat = "identity", fill = "gray90", color = "gray80") +
+  
+  # linie VaR
+  geom_line(aes(y = VaR_Prosta_99, color = "VaR Prosty"), size = 0.8) +
+  geom_line(aes(y = VaR_Wagi_99, color = "VaR z Wagami"), size = 0.8) +
+  
+  # punkty przekroczeń (wyjątki)
+  geom_point(aes(y = Hit_Point_Prosta), color = "red", shape = 8, size = 3, stroke = 1.5) +
+  geom_point(aes(y = Hit_Point_Wagi), color = "blue", shape = 4, size = 3, stroke = 1.5) +
+  
+  scale_color_manual(values = c("VaR Prosty" = "red", "VaR z Wagami" = "blue")) +
+  
+  # daty co 1 miesiąc i format r-m
+  scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m") +
+  
+  labs(title = "Weryfikacja modeli (Ostatnie 250 dni)",
+       y = "Zwrot/Dzienna zmiana ceny na giełdzie [%]", x = "Data") +
+       
+  theme_minimal() +
+  # obrót napisów żeby się zmieściły
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Wyniki wykresu:**
+
+ - **VaR z metody prostej** widać powyżej że jest bardziej stabilny. Metoda ta traktuje wszystkie obserwacje jednakowo, przez co dłużej pamięta historyczne krachy i silne spadki. Dzięki temu model jest bardziej ostrożny i zostawia sobie duży "zapas bezpieczeństwa" (czyli zakłada gorszy scenariusz, nawet gdy na rynku jest spokojnie). Na wykresie widoczne też jest, że VaR prosty był przekraczany rzadziej (ma mniejszą liczbę wyjątków).
+
+ - **VaR z metody z wagami** reaguje szybciej i bardziej dynamicznie na bieżącą sytuację na rynku. Widać że w okresie czasu gdzie zmienność była mniejsza, linia VaR przesuwa się bliżej 0, co oznacza, że model uznał sytuację za bezpieczną i przestał spodziewać się dużych strat. Przez to model nie był przygotowany na nagłe zmiany cen. Więc gdy rynek gwałtownie spadł, bariera VaR została łatwo przebita, co skutkowało większą liczbą błędów dla tej metody (wyjątków).
+
+Moje wyniki sugerują, że model Metody z Wagami w kilku przypadkach zaniżył rzeczywiste ryzyko, podczas gdy model Metody Prostej skuteczniej chronił przed nieoczekiwanymi stratami. Więc na podstawie wykresu mogę stwierdzić, że **Prosta Metoda Historyczna** zapewnia bardziej ostrożne i stabilne oszacowanie ryzyka VaR. **Metoda Historyczna z Wagami** mimo szybszej reakcji na zmiany na rynku, okazała się zbyt "optymistyczna", co doprowadziło ją do większej liczby przekroczeń/wyjątków. Czyli w moim analizowanym okresie **VaR Prosty lepiej spełnia kryteria wiarygodności w testach wstecznych**.
+
+
+
+# Ocena końcowa i wnioski
+
+## Porównanie skuteczności metod
+
+W moim projekcie przetestowałam dwie metody szacowania ryzyka na danych indeksu `WIG20`. Wyniki testów wstecznych (dla ostatnich 250 dni) dały mi następujące wyniki:
+
+1.  **Prosta Metoda Historyczna:**
+
+Zanotowała *4 wyjątki (1.6%)* i trafiła do *strefy zielonej*. Test Kupca potwierdził poprawną liczbę przekroczeń/model nie jest błędny, a Test Christoffersena wykazał brak klastrowania błędów (niezależność).
+
+2.  **Metoda Historyczna z Wagami (Zbyt ryzykowna):**
+
+Zanotowała *6 wyjątków (2.4%)*, trafiając do *strefy żółtej*. Test Kupca wyszedł na granicy odrzucenia ($p \approx 0.06$), co statystycznie potwierdza niedoszacowanie ryzyka. Jedyny plus to zaliczony Test Christoffersena (błędy nie występowały seriami). Model zbyt optymistycznie zareagował na okres spokoju przed spadkami, drastycznie zaniżając VaR, przez co nie był przygotowany na nagłą zmienność rynku.
+
+## Odpowiedzi na pytania badawcze
+
+W oparciu o wyniki testów wstecznych (dla długości m = 250), odpowiem na pytania:
+
+1. **Czy wyznaczony VaR jest wyznaczony wiarygodnie (tj. nie jest zawyżony ani zaniżony)?**
+
+Dla Prostej Metody Historycznej: **TAK.** Model jest w strefie zielonej i spełnia wszystkie wymogi statystyczne.
+
+Dla Metody Historycznej z Wagami: **NIE (jest zaniżony).** Model trafił do strefy żółtej i zbyt często dopuszczał do strat przekraczających prognozy.
+
+2. **Czy moje wyniki pozwalają twierdzić, że obie metody dają wiarygodne oszacowania?**
+
+**NIE.** W analizowanym okresie dla indeksu WIG20 tylko **Prosta Metoda Historyczna** okazała się w wiarygodna. Metoda z Wagami, mimo szybszej reakcji na zmiany, w warunkach rzeczywistych okazała się zbyt ryzykowna i wymagałaby korekty modelu.
+
