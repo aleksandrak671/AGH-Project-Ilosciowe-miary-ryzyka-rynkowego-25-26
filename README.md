@@ -1,4 +1,4 @@
-# AGH Project: Quantitative Market Risk Measures Project (2025/2026)
+# Quantitative Market Risk Measures Project (2025/2026)
 
 This repository contains the final project for the **Quantitative Market Risk Measures** course at AGH University of Science and Technology. The project focuses on analyzing market risk for the **WIG20** index using historical simulation methods.
 
